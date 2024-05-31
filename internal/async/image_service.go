@@ -18,27 +18,29 @@ type ImageRequestID struct {
 	ImageID   string
 }
 
-type ImageResult struct {
+type ImageResult[Artifact any] struct {
 	Reference string
-	Image     *image.Image
+	Artifact  Artifact
 	ModTime   *time.Time
 	Error     error
 }
 
-type ImageService struct {
-	svc       Service[ImageRequestID]
-	cache     cache.Cache[types.NamespacedName, ImageResult]
-	callbacks []func(ImageRequestID, ImageResult)
+type ImageService[Artifact any] struct {
+	svc              Service[ImageRequestID]
+	cache            cache.Cache[types.NamespacedName, ImageResult[Artifact]]
+	processImageFunc func(context.Context, ImageRequestID, *image.Image) (Artifact, error)
+	callbacks        []func(ImageRequestID, ImageResult[Artifact])
 }
 
-func NewImageService(concurrency int) *ImageService {
-	return &ImageService{
-		svc:   NewService[ImageRequestID](concurrency),
-		cache: cache.NewMemory[types.NamespacedName, ImageResult](),
+func NewImageService[Artifact any](concurrency int, processImageFunc func(context.Context, ImageRequestID, *image.Image) (Artifact, error)) *ImageService[Artifact] {
+	return &ImageService[Artifact]{
+		svc:              NewService[ImageRequestID](concurrency),
+		cache:            cache.NewMemory[types.NamespacedName, ImageResult[Artifact]](),
+		processImageFunc: processImageFunc,
 	}
 }
 
-func (s *ImageService) RegisterCallback(cb func(context.Context, ImageRequestID, ImageResult) error) {
+func (s *ImageService[Artifact]) RegisterCallback(cb func(context.Context, ImageRequestID, ImageResult[Artifact]) error) {
 	s.svc.RegisterCallback(func(ctx context.Context, reqID ImageRequestID) error {
 		result, _, err := s.cache.Get(reqID.Requester)
 		if err != nil {
@@ -48,17 +50,17 @@ func (s *ImageService) RegisterCallback(cb func(context.Context, ImageRequestID,
 	})
 }
 
-func (s *ImageService) Start(ctx context.Context) error {
+func (s *ImageService[Artifact]) Start(ctx context.Context) error {
 	return s.svc.Start(ctx)
 }
 
-func (s *ImageService) GetImage(ctx context.Context, reqID ImageRequestID, imageRef string, refreshInterval *time.Duration, pullOpts ...remote.Option) ImageResult {
+func (s *ImageService[Artifact]) GetImage(ctx context.Context, reqID ImageRequestID, imageRef string, refreshInterval *time.Duration, pullOpts ...remote.Option) ImageResult[Artifact] {
 	l := logr.FromContextOrDiscard(ctx).WithName("imageservice.get")
 
 	s.cancelStaleRequests(reqID, l)
 	result, modTime, err := s.cache.Get(reqID.Requester)
 	if err != nil && !errors.Is(err, cache.NotFoundError(nil)) {
-		return ImageResult{Error: err}
+		return ImageResult[Artifact]{Error: err}
 	}
 
 	needsRefresh := false
@@ -74,19 +76,19 @@ func (s *ImageService) GetImage(ctx context.Context, reqID ImageRequestID, image
 	}
 
 	if needsRefresh {
-		s.svc.Do(reqID, s.pullFunc(reqID.Requester, imageRef, pullOpts...))
-		return ImageResult{}
+		s.svc.Do(reqID, s.pullFunc(reqID, imageRef, pullOpts...))
+		return ImageResult[Artifact]{}
 	}
 
 	result.ModTime = modTime
 	return result
 }
 
-func (s *ImageService) DeleteImage(requestor types.NamespacedName) error {
+func (s *ImageService[Artifact]) DeleteImage(requestor types.NamespacedName) error {
 	return s.cache.Delete(requestor)
 }
 
-func (s *ImageService) cancelStaleRequests(keepID ImageRequestID, l logr.Logger) {
+func (s *ImageService[Artifact]) cancelStaleRequests(keepID ImageRequestID, l logr.Logger) {
 	staleRequests := []ImageRequestID{}
 	s.svc.WalkRequests(func(reqID ImageRequestID) {
 		if reqID == keepID {
@@ -102,11 +104,15 @@ func (s *ImageService) cancelStaleRequests(keepID ImageRequestID, l logr.Logger)
 	}
 }
 
-func (s *ImageService) pullFunc(requester types.NamespacedName, imageRef string, pullOpts ...remote.Option) func(context.Context) error {
+func (s *ImageService[Artifact]) pullFunc(req ImageRequestID, imageRef string, pullOpts ...remote.Option) func(context.Context) error {
 	return func(ctx context.Context) error {
 		img, err := image.Pull(ctx, imageRef, pullOpts...)
-		result := ImageResult{Reference: imageRef, Image: img, Error: err}
-		if err := s.cache.Set(requester, result); err != nil {
+		result := ImageResult[Artifact]{Reference: imageRef, Error: err}
+		if err == nil {
+			artifact, err := s.processImageFunc(ctx, req, img)
+			result = ImageResult[Artifact]{Reference: imageRef, Artifact: artifact, Error: err}
+		}
+		if err := s.cache.Set(req.Requester, result); err != nil {
 			return errors.Join(result.Error, err)
 		}
 		return result.Error
@@ -115,6 +121,13 @@ func (s *ImageService) pullFunc(requester types.NamespacedName, imageRef string,
 
 type cacheError struct {
 	err error
+}
+
+func (e *cacheError) Error() string {
+	if e == nil || e.err == nil {
+		return ""
+	}
+	return e.err.Error()
 }
 
 func IsCacheError(err error) bool {

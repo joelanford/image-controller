@@ -155,7 +155,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	contentHandler, err := httputil.ContentHandler(filepath.Join(cacheDir, "serve"), cfg, setupLog)
+	contentHandler, err := httputil.ContentHandler(filepath.Join(cacheDir, "content"), externalURLBase.Path, cfg, setupLog)
 	if err != nil {
 		setupLog.Error(err, "unable to create content handler")
 		os.Exit(1)

@@ -3,15 +3,15 @@ package httputil
 import (
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 )
 
-func ContentHandler(contentRoot string, cfg *rest.Config, l logr.Logger) (http.Handler, error) {
+func ContentHandler(contentRoot string, urlPath string, cfg *rest.Config, l logr.Logger) (http.Handler, error) {
 	serveHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet, http.MethodHead:
@@ -20,12 +20,8 @@ func ContentHandler(contentRoot string, cfg *rest.Config, l logr.Logger) (http.H
 			return
 		}
 
-		path := r.URL.Path
-		target, err := os.Readlink(filepath.Join(contentRoot, path))
-		if err != nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
+		path := strings.TrimPrefix(r.URL.Path, urlPath)
+		target := filepath.Join(contentRoot, path)
 		etag := filepath.Base(target)
 		if r.Header.Get("If-None-Match") == etag {
 			w.WriteHeader(http.StatusNotModified)

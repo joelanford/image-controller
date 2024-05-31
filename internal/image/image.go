@@ -16,7 +16,6 @@ import (
 	containerregistryv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/nlepage/go-tarfs"
 )
 
@@ -48,18 +47,6 @@ func Pull(ctx context.Context, reference string, opts ...remote.Option) (*Image,
 		return nil, fmt.Errorf("error pulling image: %w", err)
 	}
 
-	// TODO: Find a more efficient way of tracking the image. We eventually store
-	//   the image data into the memory-backed cache
-	buf := new(bytes.Buffer)
-	if err := tarball.Write(ref, img, buf); err != nil {
-		return nil, fmt.Errorf("error writing image to tarball: %w", err)
-	}
-	img, err = tarball.Image(func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
-	}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error reading image from tarball: %w", err)
-	}
 	return &Image{img}, nil
 }
 

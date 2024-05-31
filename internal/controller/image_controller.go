@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -55,7 +56,7 @@ type ImageReconciler struct {
 	Scheme     *k8sruntime.Scheme
 	Finalizers finalizer.Finalizers
 
-	ImageService       *async.ImageService
+	ImageService       *async.ImageService[string]
 	imageStoreRootPath string
 	contentURLBase     url.URL
 }
@@ -107,6 +108,11 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 	dur := durationFor(img.Spec.RefreshInterval)
 
+	existingArtifacts, err := os.ReadDir(filepath.Join(r.catalogsRootPath(), req.Namespace, req.Name))
+	if err != nil {
+		l.Info("could not read image store directory to find existing artifacts", "error", err)
+	}
+
 	imageResult := r.ImageService.GetImage(ctx, async.ImageRequestID{req.NamespacedName, idOf(img.Spec)}, img.Spec.Reference, dur)
 	if imageResult.Error != nil {
 		reason := "ImagePullFailed"
@@ -132,7 +138,7 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, r.Status().Update(ctx, &img)
 	}
 
-	if imageResult.Image == nil {
+	if imageResult.Artifact == "" {
 		meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeFailing)
 		meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
 			Type:               utilv1alpha1.ConditionTypeProgressing,
@@ -145,72 +151,7 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, r.Status().Update(ctx, &img)
 	}
 
-	imgDigest, err := imageResult.Image.Digest()
-	if err != nil {
-		reason := "ImageDigestLookupFailed"
-		meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
-			Type:               utilv1alpha1.ConditionTypeFailing,
-			Status:             metav1.ConditionTrue,
-			Reason:             reason,
-			Message:            err.Error(),
-			ObservedGeneration: img.Generation,
-		})
-		meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
-			Type:               utilv1alpha1.ConditionTypeProgressing,
-			Status:             metav1.ConditionTrue,
-			Reason:             "RetryingDigestLookup",
-			Message:            "Retrying image pull",
-			ObservedGeneration: img.Generation,
-		})
-		l.Info(reason, "error", err)
-		return ctrl.Result{}, errors.Join(err, r.Status().Update(ctx, &img))
-	}
-
-	extractPath := filepath.Join(r.imageStoreRootPath, req.Namespace, req.Name, imgDigest.String())
-	extractPathExists, err := checkExtractPath(extractPath)
-	if err != nil {
-		reason := "InvalidExtractPath"
-		meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
-			Type:               utilv1alpha1.ConditionTypeFailing,
-			Status:             metav1.ConditionTrue,
-			Reason:             reason,
-			Message:            err.Error(),
-			ObservedGeneration: img.Generation,
-		})
-		meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
-			Type:               utilv1alpha1.ConditionTypeProgressing,
-			Status:             metav1.ConditionTrue,
-			Reason:             "RetryingExtraction",
-			Message:            "Retrying extraction",
-			ObservedGeneration: img.Generation,
-		})
-		l.Info(reason, "error", err)
-		return ctrl.Result{}, errors.Join(err, r.Status().Update(ctx, &img))
-	}
-	if !extractPathExists {
-		extractStartTime := time.Now()
-		l.Info("Extracting image content")
-		if err := r.extractImage(ctx, imageResult.Image, req.NamespacedName, imgDigest.String()); err != nil {
-			reason := "ExtractFailed"
-			meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
-				Type:               utilv1alpha1.ConditionTypeFailing,
-				Status:             metav1.ConditionTrue,
-				Reason:             reason,
-				Message:            err.Error(),
-				ObservedGeneration: img.Generation,
-			})
-			meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
-				Type:               utilv1alpha1.ConditionTypeProgressing,
-				Status:             metav1.ConditionTrue,
-				Reason:             "RetryingExtraction",
-				Message:            "Retrying extraction",
-				ObservedGeneration: img.Generation,
-			})
-			l.Info(reason, "error", err)
-			return ctrl.Result{}, errors.Join(err, r.Status().Update(ctx, &img))
-		}
-		l.Info("Extracted image content", "duration", time.Since(extractStartTime))
-	}
+	imgDigest := filepath.Base(imageResult.Artifact)
 
 	meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeFailing)
 	meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeProgressing)
@@ -221,8 +162,8 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		Message:            "image is ready",
 		ObservedGeneration: img.Generation,
 	})
-	img.Status.Digest = imgDigest.String()
-	img.Status.ContentURL = r.contentURLBase.String() + path.Join("/", req.Namespace, req.Name, "catalog.json")
+	img.Status.Digest = imgDigest
+	img.Status.ContentURL = r.contentURLBase.String() + path.Join("/", strings.TrimPrefix(imageResult.Artifact, r.catalogsRootPath()))
 
 	l.V(1).Info("image is ready")
 
@@ -234,6 +175,13 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		requeueAfter = expiration.Sub(time.Now())
 		l.V(1).Info("requeue for refresh", "at", expiration, "in", requeueAfter)
 	}
+	defer func() {
+		for _, artifact := range existingArtifacts {
+			if artifact.Name() != imgDigest {
+				os.Remove(filepath.Join(r.catalogsRootPath(), req.Namespace, req.Name, artifact.Name()))
+			}
+		}
+	}()
 	return ctrl.Result{RequeueAfter: requeueAfter}, r.Status().Update(ctx, &img)
 }
 
@@ -251,10 +199,22 @@ func checkExtractPath(path string) (bool, error) {
 	return true, nil
 }
 
-func (r *ImageReconciler) extractImage(ctx context.Context, img *image.Image, requestor types.NamespacedName, digest string) error {
-	extractPath := filepath.Join(r.imageStoreRootPath, "extract", requestor.Namespace, requestor.Name, digest)
-	symlinkPath := filepath.Join(r.imageStoreRootPath, "serve", requestor.Namespace, requestor.Name, "catalog.json")
+func (r *ImageReconciler) extractImage(ctx context.Context, img *image.Image, requestor types.NamespacedName) (string, error) {
+	imgDigest, err := img.Digest()
+	if err != nil {
+		return "", err
+	}
+
+	extractPath := filepath.Join(r.catalogsRootPath(), requestor.Namespace, requestor.Name, imgDigest.String())
 	tmpDirRoot := filepath.Join(r.imageStoreRootPath, "tmp")
+
+	extractPathExists, err := checkExtractPath(extractPath)
+	if err != nil {
+		return "", err
+	}
+	if extractPathExists {
+		return extractPath, nil
+	}
 
 	var fbcRootDir string
 	mountDir, err := img.MountTemp(ctx, tmpDirRoot, image.WithSubPathGetter(func(img containerregistryv1.Image) (string, error) {
@@ -269,12 +229,12 @@ func (r *ImageReconciler) extractImage(ctx context.Context, img *image.Image, re
 		defer os.RemoveAll(mountDir)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	tmpFile, err := os.CreateTemp(tmpDirRoot, ".catalog-*.json")
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() {
 		tmpFile.Close()
@@ -290,42 +250,18 @@ func (r *ImageReconciler) extractImage(ctx context.Context, img *image.Image, re
 		_, err = tmpFile.Write(meta.Blob)
 		return err
 	}); err != nil {
-		return err
+		return "", err
 	}
 	if err := tmpFile.Close(); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(extractPath), 0755); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Rename(tmpFile.Name(), extractPath); err != nil {
-		return err
+		return "", err
 	}
-
-	if err := os.MkdirAll(filepath.Dir(symlinkPath), 0755); err != nil {
-		return err
-	}
-	tmpSymlink := filepath.Join(filepath.Dir(symlinkPath), fmt.Sprintf(".%s.tmp", filepath.Base(symlinkPath)))
-	if err := os.Symlink(extractPath, tmpSymlink); err != nil {
-		return err
-	}
-
-	oldExtractPath, err := os.Readlink(symlinkPath)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	defer os.Remove(tmpSymlink)
-	if err := os.Rename(tmpSymlink, symlinkPath); err != nil {
-		return err
-	}
-
-	if oldExtractPath != "" && oldExtractPath != extractPath {
-		if err := os.RemoveAll(oldExtractPath); err != nil {
-			return err
-		}
-	}
-	return nil
+	return extractPath, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -336,8 +272,14 @@ func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, imageStoreRootPath 
 	imageSvcSource := source.Channel[reconcile.Request](imageSvcEvents, handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
 		return []reconcile.Request{req}
 	}))
-	r.ImageService = async.NewImageService(runtime.NumCPU())
-	r.ImageService.RegisterCallback(func(ctx context.Context, req async.ImageRequestID, _ async.ImageResult) error {
+	r.ImageService = async.NewImageService[string](runtime.NumCPU(), func(ctx context.Context, req async.ImageRequestID, img *image.Image) (string, error) {
+		extractPath, err := r.extractImage(ctx, img, req.Requester)
+		if err != nil {
+			return "", err
+		}
+		return extractPath, nil
+	})
+	r.ImageService.RegisterCallback(func(ctx context.Context, req async.ImageRequestID, _ async.ImageResult[string]) error {
 		select {
 		case imageSvcEvents <- event.TypedGenericEvent[reconcile.Request]{Object: reconcile.Request{NamespacedName: req.Requester}}:
 		case <-ctx.Done():
@@ -355,7 +297,7 @@ func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, imageStoreRootPath 
 			return finalizer.Result{}, err
 		}
 
-		if err := recursiveDelete(r.imageStoreRootPath, filepath.Join(obj.GetNamespace(), obj.GetName())); err != nil {
+		if err := recursiveDelete(r.catalogsRootPath(), filepath.Join(obj.GetNamespace(), obj.GetName())); err != nil {
 			return finalizer.Result{}, err
 		}
 		return finalizer.Result{}, nil
@@ -371,6 +313,10 @@ func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, imageStoreRootPath 
 		For(&utilv1alpha1.Image{}).
 		WatchesRawSource(imageSvcSource).
 		Complete(r)
+}
+
+func (r *ImageReconciler) catalogsRootPath() string {
+	return filepath.Join(r.imageStoreRootPath, "content")
 }
 
 func idOf(imgSpec utilv1alpha1.ImageSpec) string {
