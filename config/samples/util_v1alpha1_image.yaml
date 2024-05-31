@@ -1,0 +1,9 @@
+apiVersion: util.lanford.io/v1alpha1
+kind: Image
+metadata:
+  labels:
+    app.kubernetes.io/name: image-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: image-sample
+spec:
+  reference: quay.io/joelanford/ophub:migrated
