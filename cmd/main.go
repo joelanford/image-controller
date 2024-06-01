@@ -17,10 +17,9 @@ limitations under the License.
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"flag"
-	"net"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -33,7 +32,7 @@ import (
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
-	certutil "k8s.io/client-go/util/cert"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -42,6 +41,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	utilv1alpha1 "github.com/joelanford/image-controller/api/v1alpha1"
+	"github.com/joelanford/image-controller/internal/certutil"
 	"github.com/joelanford/image-controller/internal/controller"
 	"github.com/joelanford/image-controller/internal/httputil"
 )
@@ -59,16 +59,21 @@ func init() {
 }
 
 func main() {
-	var metricsAddr string
-	var probeAddr string
-	var certPath string
-	var keyPath string
-	var contentListenAddr string
-	var rawExternalContentURLBase string
+	var (
+		metricsAddr               string
+		probeAddr                 string
+		certPath                  string
+		keyPath                   string
+		cacheDir                  string
+		contentListenAddr         string
+		rawExternalContentURLBase string
+	)
+
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&certPath, "cert", "", "Path to the certificate file")
 	flag.StringVar(&keyPath, "key", "", "Path to the key file")
+	flag.StringVar(&cacheDir, "cache-dir", "", "Path to the cache directory")
 	flag.StringVar(&contentListenAddr, "content-bind-address", "localhost:9443", "The address the content server binds to")
 	flag.StringVar(&rawExternalContentURLBase, "external-url-base", "https://localhost:9443/catalogs", "The base URL where clients can access image content.")
 	opts := zap.Options{
@@ -78,64 +83,35 @@ func main() {
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	externalURLBase, err := url.Parse(rawExternalContentURLBase)
-	if err != nil {
-		setupLog.Error(err, "unable to parse external URL base")
-		os.Exit(1)
-	}
-
-	var tlsOpts []func(*tls.Config)
-	switch {
-	case certPath == "" && keyPath == "":
-		setupLog.Info("no certificate or key provided, generating self-signed certificate")
-		tlsOpts = append(tlsOpts, func(cfg *tls.Config) {
-			cert, key, err := certutil.GenerateSelfSignedCertKey("localhost", []net.IP{[]byte{127, 0, 0, 1}}, []string{externalURLBase.Hostname()})
-			if err != nil {
-				setupLog.Error(err, "unable to generate self-signed certificate")
-				os.Exit(1)
-			}
-			keyPair, err := tls.X509KeyPair(cert, key)
-			if err != nil {
-				setupLog.Error(err, "unable to create key pair")
-				os.Exit(1)
-			}
-			cfg.Certificates = []tls.Certificate{keyPair}
-		})
-	case certPath != "" && keyPath != "":
-		setupLog.Info("using provided certificate and key")
-		tlsOpts = append(tlsOpts, func(cfg *tls.Config) {
-			keyPair, err := tls.LoadX509KeyPair(certPath, keyPath)
-			if err != nil {
-				setupLog.Error(err, "unable to load key pair")
-				os.Exit(1)
-			}
-			cfg.Certificates = []tls.Certificate{keyPair}
-		})
-	default:
-		setupLog.Error(nil, "certificate and key must both be provided together")
-		os.Exit(1)
-	}
-
-	contentServerTLSConfig := &tls.Config{}
-	for _, opt := range tlsOpts {
-		opt(contentServerTLSConfig)
-	}
-
+	// Standard controller-runtime setup of context and Kubernetes
+	// REST configuration.
 	ctx := ctrl.SetupSignalHandler()
-
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
 		setupLog.Error(err, "unable to get rest config")
 		os.Exit(1)
 	}
 
+	// Setup TLS configuration
+	tlsConfig := &tls.Config{}
+	certWatcher, err := certutil.ConfigureTLSCertificateRunnable(tlsConfig, certPath, keyPath, setupLog)
+	if err != nil {
+		setupLog.Error(err, "unable to get or generate cert")
+		os.Exit(1)
+	}
+
+	// Create the manager
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress:    metricsAddr,
 			FilterProvider: filters.WithAuthenticationAndAuthorization,
 			SecureServing:  true,
-			TLSOpts:        tlsOpts,
+			TLSOpts: []func(*tls.Config){
+				func(metricsTLSConfig *tls.Config) {
+					*metricsTLSConfig = *tlsConfig
+				},
+			},
 		},
 		HealthProbeBindAddress: probeAddr,
 	})
@@ -144,9 +120,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	cacheDir, ok := os.LookupEnv("CACHE_DIR")
-	if !ok {
-		setupLog.Error(err, "CACHE_DIR not set")
+	// Add the certificate watcher to the manager
+	if err := mgr.Add(certWatcher); err != nil {
+		setupLog.Error(err, "unable to add certificate watcher")
+		os.Exit(1)
+	}
+
+	// Get the absolute path of the cache directory.
+	if cacheDir == "" {
+		setupLog.Error(fmt.Errorf("cache directory not set"), "--cache-dir flag is required")
 		os.Exit(1)
 	}
 	cacheDir, err = filepath.Abs(cacheDir)
@@ -155,31 +137,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	contentHandler, err := httputil.ContentHandler(filepath.Join(cacheDir, "content"), externalURLBase.Path, cfg, setupLog)
+	// Parse the external URL base
+	externalURLBase, err := url.Parse(rawExternalContentURLBase)
 	if err != nil {
-		setupLog.Error(err, "unable to create content handler")
+		setupLog.Error(err, "unable to parse external URL base")
 		os.Exit(1)
 	}
-	contentListener, err := tls.Listen("tcp", contentListenAddr, contentServerTLSConfig)
+
+	// Set up the content server and add it to the manager
+	contentServer, err := setupContentServer(
+		contentListenAddr,
+		externalURLBase.Path,
+		filepath.Join(cacheDir, "content"),
+		tlsConfig,
+		cfg,
+	)
 	if err != nil {
-		setupLog.Error(err, "unable to create content listener")
+		setupLog.Error(err, "unable to set up content server")
 		os.Exit(1)
-	}
-	contentServer := &manager.Server{
-		Name:     "content",
-		Listener: contentListener,
-		Server: &http.Server{
-			Handler:           contentHandler,
-			TLSConfig:         contentServerTLSConfig,
-			ReadTimeout:       time.Second,
-			ReadHeaderTimeout: time.Second,
-			WriteTimeout:      time.Minute * 10,
-			IdleTimeout:       time.Second,
-			BaseContext: func(listener net.Listener) context.Context {
-				return ctx
-			},
-		},
-		OnlyServeWhenLeader: true,
 	}
 	if err := mgr.Add(contentServer); err != nil {
 		setupLog.Error(err, "unable to add content server")
@@ -187,8 +162,10 @@ func main() {
 	}
 
 	if err = (&controller.ImageReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		CacheDir:        cacheDir,
+		ExternalURLBase: *externalURLBase,
 	}).SetupWithManager(mgr, cacheDir, *externalURLBase); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Image")
 		os.Exit(1)
@@ -209,4 +186,28 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func setupContentServer(listenAddr, basePath, serveRoot string, tlsConfig *tls.Config, cfg *rest.Config) (*manager.Server, error) {
+	contentHandler, err := httputil.ContentHandler(serveRoot, basePath, cfg, setupLog)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create content handler: %w", err)
+	}
+	contentListener, err := tls.Listen("tcp", listenAddr, tlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create content listener: %w", err)
+	}
+	contentServer := &manager.Server{
+		Name:     "content",
+		Listener: contentListener,
+		Server: &http.Server{
+			Handler:           contentHandler,
+			ReadTimeout:       time.Second,
+			ReadHeaderTimeout: time.Second,
+			WriteTimeout:      time.Minute * 10,
+			IdleTimeout:       time.Second,
+		},
+		OnlyServeWhenLeader: true,
+	}
+	return contentServer, nil
 }

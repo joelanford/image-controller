@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -53,12 +52,12 @@ import (
 // ImageReconciler reconciles a Image object
 type ImageReconciler struct {
 	client.Client
-	Scheme     *k8sruntime.Scheme
-	Finalizers finalizer.Finalizers
+	Scheme          *k8sruntime.Scheme
+	CacheDir        string
+	ExternalURLBase url.URL
 
-	ImageService       *async.ImageService[string]
-	imageStoreRootPath string
-	contentURLBase     url.URL
+	finalizers   finalizer.Finalizers
+	imageService *async.ImageService[string]
 }
 
 //+kubebuilder:rbac:groups=util.lanford.io,resources=images,verbs=get;list;watch;create;update;patch;delete
@@ -75,17 +74,13 @@ type ImageReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.17.3/pkg/reconcile
 func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	l := log.FromContext(ctx)
-	l.Info("start reconcile")
-	defer l.Info("finish reconcile")
-
 	// Get the current desired image
 	var img utilv1alpha1.Image
 	if err := r.Get(ctx, req.NamespacedName, &img); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	res, err := r.Finalizers.Finalize(ctx, &img)
+	res, err := r.finalizers.Finalize(ctx, &img)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -99,23 +94,43 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if len(finalizerUpdateErrs) > 0 {
 		return ctrl.Result{}, errors.Join(finalizerUpdateErrs...)
 	}
+	return r.reconcileImage(ctx, &img)
+}
 
-	durationFor := func(d *metav1.Duration) *time.Duration {
-		if d == nil {
-			return nil
-		}
-		return &d.Duration
+func (r *ImageReconciler) reconcileImage(ctx context.Context, img *utilv1alpha1.Image) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+	l.Info("start reconcile")
+	defer l.Info("finish reconcile")
+
+	// Look for existing stored artifacts and make sure the existing status reflects the current state.
+	// If it does not, something went wrong (maybe our storage was deleted?). In that case, we need to
+	// clear the status to reflect the actual state of the backend storage (and the fact that it is no
+	// longer available).
+	existingArtifacts, err := os.ReadDir(r.catalogFilePath(client.ObjectKeyFromObject(img), ""))
+	if err != nil && !os.IsNotExist(err) {
+		l.Info("could not find existing artifacts", "error", err)
 	}
+	if !r.statusMatchesFilesystem(img.Status, existingArtifacts) {
+		l.Info("status does not match filesystem, clearing status")
+		img.Status.Digest = ""
+		img.Status.ContentURL = ""
+		img.Status.ExpirationTime = nil
+		meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeReady)
+	}
+
+	// Next we get the image. This will either return a cached image or enqueue a background
+	// task to fetch or refresh the image.
 	dur := durationFor(img.Spec.RefreshInterval)
+	imageResult := r.imageService.GetImage(ctx, requestID(img), img.Spec.Reference, dur)
 
-	existingArtifacts, err := os.ReadDir(filepath.Join(r.catalogsRootPath(), req.Namespace, req.Name))
-	if err != nil {
-		l.Info("could not read image store directory to find existing artifacts", "error", err)
-	}
-
-	imageResult := r.ImageService.GetImage(ctx, async.ImageRequestID{req.NamespacedName, idOf(img.Spec)}, img.Spec.Reference, dur)
+	// The there was an error fetching the image, we need to update the status to reflect that.
+	// Make sure _not_ to touch the Ready condition or other associated fields. We want to keep
+	// the original image data around so the clients can still fetch it if they desire.
+	//
+	// Clients will be able to tell that the Ready condition is stale because its observedGeneration
+	// will not match the current generation.
 	if imageResult.Error != nil {
-		reason := "ImagePullFailed"
+		reason := "ImageFetchFailed"
 		if async.IsCacheError(imageResult.Error) {
 			reason = "ImageCacheLookupFailed"
 		}
@@ -129,30 +144,33 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
 			Type:               utilv1alpha1.ConditionTypeProgressing,
 			Status:             metav1.ConditionTrue,
-			Reason:             "RetryingImagePull",
-			Message:            "Retrying image pull",
+			Reason:             "RetryingImageFetch",
+			Message:            "Retrying image fetch",
 			ObservedGeneration: img.Generation,
 		})
 
 		l.Info(reason, "error", imageResult.Error)
-		return ctrl.Result{}, r.Status().Update(ctx, &img)
+		return ctrl.Result{}, r.Status().Update(ctx, img)
 	}
 
+	// If there was no error or artifact, that means the image is still being fetched.
+	// Again, we don't want to touch the Ready condition or other associated fields
+	// while the update is in progress.
 	if imageResult.Artifact == "" {
 		meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeFailing)
 		meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
 			Type:               utilv1alpha1.ConditionTypeProgressing,
 			Status:             metav1.ConditionTrue,
-			Reason:             "PullingImage",
-			Message:            "image pull is pending",
+			Reason:             "FetchingImage",
+			Message:            "image fetch is pending",
 			ObservedGeneration: img.Generation,
 		})
 		l.Info("Pulling")
-		return ctrl.Result{}, r.Status().Update(ctx, &img)
+		return ctrl.Result{}, r.Status().Update(ctx, img)
 	}
 
-	imgDigest := filepath.Base(imageResult.Artifact)
-
+	// If we got here, we have a valid artifact. We can now update the status to reflect that.
+	// We clear the Failing and Progressing conditions and set the Ready condition to True.
 	meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeFailing)
 	meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeProgressing)
 	meta.SetStatusCondition(&img.Status.Conditions, metav1.Condition{
@@ -162,10 +180,17 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		Message:            "image is ready",
 		ObservedGeneration: img.Generation,
 	})
+	imgDigest := filepath.Base(imageResult.Artifact)
 	img.Status.Digest = imgDigest
-	img.Status.ContentURL = r.contentURLBase.String() + path.Join("/", strings.TrimPrefix(imageResult.Artifact, r.catalogsRootPath()))
-
+	img.Status.ContentURL = r.catalogContentURL(client.ObjectKeyFromObject(img), imgDigest).String()
 	l.V(1).Info("image is ready")
+	defer func() {
+		for _, artifact := range existingArtifacts {
+			if artifact.Name() != imgDigest {
+				os.Remove(r.catalogFilePath(client.ObjectKeyFromObject(img), artifact.Name()))
+			}
+		}
+	}()
 
 	var requeueAfter time.Duration
 	if dur != nil {
@@ -175,28 +200,58 @@ func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		requeueAfter = expiration.Sub(time.Now())
 		l.V(1).Info("requeue for refresh", "at", expiration, "in", requeueAfter)
 	}
-	defer func() {
-		for _, artifact := range existingArtifacts {
-			if artifact.Name() != imgDigest {
-				os.Remove(filepath.Join(r.catalogsRootPath(), req.Namespace, req.Name, artifact.Name()))
-			}
-		}
-	}()
-	return ctrl.Result{RequeueAfter: requeueAfter}, r.Status().Update(ctx, &img)
+	return ctrl.Result{RequeueAfter: requeueAfter}, r.Status().Update(ctx, img)
 }
 
-func checkExtractPath(path string) (bool, error) {
-	stat, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return false, nil
+// SetupWithManager sets up the controller with the Manager.
+func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, CacheDir string, ExternalURLBase url.URL) error {
+	r.CacheDir = CacheDir
+	r.ExternalURLBase = ExternalURLBase
+	imageSvcEvents := make(chan event.TypedGenericEvent[reconcile.Request])
+	imageSvcSource := source.Channel[reconcile.Request](imageSvcEvents, handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
+		return []reconcile.Request{req}
+	}))
+	r.imageService = async.NewImageService[string](runtime.NumCPU(), func(ctx context.Context, req async.ImageRequestID, img *image.Image) (string, error) {
+		extractPath, err := r.extractImage(ctx, img, req.Requester)
+		if err != nil {
+			return "", err
+		}
+		return extractPath, nil
+	})
+	r.imageService.RegisterCallback(func(ctx context.Context, req async.ImageRequestID, _ async.ImageResult[string]) error {
+		select {
+		case imageSvcEvents <- event.TypedGenericEvent[reconcile.Request]{Object: reconcile.Request{NamespacedName: req.Requester}}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	})
+
+	r.finalizers = finalizer.NewFinalizers()
+	if err := r.finalizers.Register("util.lanford.io/delete-image", finalizerFunc(func(ctx context.Context, obj client.Object) (finalizer.Result, error) {
+		l := logr.FromContextOrDiscard(ctx)
+		l.Info("deleting image from cache")
+
+		if err := r.imageService.DeleteImage(client.ObjectKeyFromObject(obj)); err != nil {
+			return finalizer.Result{}, err
+		}
+
+		if err := recursiveDelete(r.catalogsRootPath(), catalogRelativePath(client.ObjectKeyFromObject(obj), "")); err != nil {
+			return finalizer.Result{}, err
+		}
+		return finalizer.Result{}, nil
+	})); err != nil {
+		return err
 	}
-	if err != nil {
-		return false, err
+
+	if err := mgr.Add(r.imageService); err != nil {
+		return err
 	}
-	if !stat.Mode().IsRegular() {
-		return false, fmt.Errorf("extract path %q is not a regular file", path)
-	}
-	return true, nil
+
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&utilv1alpha1.Image{}).
+		WatchesRawSource(imageSvcSource).
+		Complete(r)
 }
 
 func (r *ImageReconciler) extractImage(ctx context.Context, img *image.Image, requestor types.NamespacedName) (string, error) {
@@ -205,8 +260,8 @@ func (r *ImageReconciler) extractImage(ctx context.Context, img *image.Image, re
 		return "", err
 	}
 
-	extractPath := filepath.Join(r.catalogsRootPath(), requestor.Namespace, requestor.Name, imgDigest.String())
-	tmpDirRoot := filepath.Join(r.imageStoreRootPath, "tmp")
+	extractPath := r.catalogFilePath(requestor, imgDigest.String())
+	tmpDirRoot := filepath.Join(r.CacheDir, "tmp")
 
 	extractPathExists, err := checkExtractPath(extractPath)
 	if err != nil {
@@ -264,63 +319,47 @@ func (r *ImageReconciler) extractImage(ctx context.Context, img *image.Image, re
 	return extractPath, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, imageStoreRootPath string, contentURLBase url.URL) error {
-	r.imageStoreRootPath = imageStoreRootPath
-	r.contentURLBase = contentURLBase
-	imageSvcEvents := make(chan event.TypedGenericEvent[reconcile.Request])
-	imageSvcSource := source.Channel[reconcile.Request](imageSvcEvents, handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
-		return []reconcile.Request{req}
-	}))
-	r.ImageService = async.NewImageService[string](runtime.NumCPU(), func(ctx context.Context, req async.ImageRequestID, img *image.Image) (string, error) {
-		extractPath, err := r.extractImage(ctx, img, req.Requester)
-		if err != nil {
-			return "", err
-		}
-		return extractPath, nil
-	})
-	r.ImageService.RegisterCallback(func(ctx context.Context, req async.ImageRequestID, _ async.ImageResult[string]) error {
-		select {
-		case imageSvcEvents <- event.TypedGenericEvent[reconcile.Request]{Object: reconcile.Request{NamespacedName: req.Requester}}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		return nil
-	})
-
-	r.Finalizers = finalizer.NewFinalizers()
-	if err := r.Finalizers.Register("util.lanford.io/delete-image", finalizerFunc(func(ctx context.Context, obj client.Object) (finalizer.Result, error) {
-		l := logr.FromContextOrDiscard(ctx)
-		l.Info("deleting image from cache")
-
-		if err := r.ImageService.DeleteImage(client.ObjectKeyFromObject(obj)); err != nil {
-			return finalizer.Result{}, err
-		}
-
-		if err := recursiveDelete(r.catalogsRootPath(), filepath.Join(obj.GetNamespace(), obj.GetName())); err != nil {
-			return finalizer.Result{}, err
-		}
-		return finalizer.Result{}, nil
-	})); err != nil {
-		return err
+func checkExtractPath(path string) (bool, error) {
+	stat, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return false, nil
 	}
-
-	if err := mgr.Add(r.ImageService); err != nil {
-		return err
+	if err != nil {
+		return false, err
 	}
+	if !stat.Mode().IsRegular() {
+		return false, fmt.Errorf("extract path %q is not a regular file", path)
+	}
+	return true, nil
+}
 
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&utilv1alpha1.Image{}).
-		WatchesRawSource(imageSvcSource).
-		Complete(r)
+func (r *ImageReconciler) statusMatchesFilesystem(status utilv1alpha1.ImageStatus, files []os.DirEntry) bool {
+	for _, file := range files {
+		if file.Name() == status.Digest {
+			return true
+		}
+	}
+	return status.Digest == "" && len(files) == 0
 }
 
 func (r *ImageReconciler) catalogsRootPath() string {
-	return filepath.Join(r.imageStoreRootPath, "content")
+	return filepath.Join(r.CacheDir, "content")
 }
 
-func idOf(imgSpec utilv1alpha1.ImageSpec) string {
-	return fmt.Sprintf("%s", imgSpec.Reference)
+func catalogRelativePath(key types.NamespacedName, digest string) string {
+	return filepath.Join(key.Namespace, key.Name, digest)
+}
+
+func (r *ImageReconciler) catalogFilePath(key types.NamespacedName, digest string) string {
+	return filepath.Join(r.catalogsRootPath(), catalogRelativePath(key, digest))
+}
+
+func (r *ImageReconciler) catalogContentURL(key types.NamespacedName, digest string) *url.URL {
+	return r.ExternalURLBase.JoinPath(strings.ReplaceAll(catalogRelativePath(key, digest), string(filepath.Separator), "/"))
+}
+
+func requestID(img *utilv1alpha1.Image) async.ImageRequestID {
+	return async.ImageRequestID{Requester: client.ObjectKeyFromObject(img), ImageID: fmt.Sprintf("%s", img.Spec.Reference)}
 }
 
 func recursiveDelete(root, subpath string) error {
@@ -344,6 +383,13 @@ func recursiveDelete(root, subpath string) error {
 		deletePath = dirPath
 	}
 	return nil
+}
+
+func durationFor(d *metav1.Duration) *time.Duration {
+	if d == nil {
+		return nil
+	}
+	return &d.Duration
 }
 
 type finalizerFunc func(context.Context, client.Object) (finalizer.Result, error)
