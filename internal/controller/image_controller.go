@@ -118,7 +118,7 @@ func (r *ImageReconciler) reconcileImage(ctx context.Context, img *utilv1alpha1.
 		meta.RemoveStatusCondition(&img.Status.Conditions, utilv1alpha1.ConditionTypeReady)
 	}
 
-	// Next we get the image. This will either return a cached image or enqueue a background
+	// Next we get the image. This will either return a cached imageResult or enqueue a background
 	// task to fetch or refresh the image.
 	dur := durationFor(img.Spec.RefreshInterval)
 	imageResult := r.imageService.GetImage(ctx, requestID(img), img.Spec.Reference, dur)
@@ -204,13 +204,10 @@ func (r *ImageReconciler) reconcileImage(ctx context.Context, img *utilv1alpha1.
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, CacheDir string, ExternalURLBase url.URL) error {
-	r.CacheDir = CacheDir
-	r.ExternalURLBase = ExternalURLBase
-	imageSvcEvents := make(chan event.TypedGenericEvent[reconcile.Request])
-	imageSvcSource := source.Channel[reconcile.Request](imageSvcEvents, handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
-		return []reconcile.Request{req}
-	}))
+func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Make a new image service with an image handler that extracts the image to a flattened catalog file
+	// to a file in the cache directory at a path built with image object's namespace and name as well as
+	// the image digest.
 	r.imageService = async.NewImageService[string](runtime.NumCPU(), func(ctx context.Context, req async.ImageRequestID, img *image.Image) (string, error) {
 		extractPath, err := r.extractImage(ctx, img, req.Requester)
 		if err != nil {
@@ -218,6 +215,13 @@ func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, CacheDir string, Ex
 		}
 		return extractPath, nil
 	})
+
+	// Add a callback to the image service that enqueues a reconcile request for the image object
+	// whenever an image request completes.
+	imageSvcEvents := make(chan event.TypedGenericEvent[reconcile.Request])
+	imageSvcSource := source.Channel[reconcile.Request](imageSvcEvents, handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, req reconcile.Request) []reconcile.Request {
+		return []reconcile.Request{req}
+	}))
 	r.imageService.RegisterCallback(func(ctx context.Context, req async.ImageRequestID, _ async.ImageResult[string]) error {
 		select {
 		case imageSvcEvents <- event.TypedGenericEvent[reconcile.Request]{Object: reconcile.Request{NamespacedName: req.Requester}}:
@@ -226,7 +230,11 @@ func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, CacheDir string, Ex
 		}
 		return nil
 	})
+	if err := mgr.Add(r.imageService); err != nil {
+		return err
+	}
 
+	// Add a finalizer that deletes the cached image and stored catalog file for the image object
 	r.finalizers = finalizer.NewFinalizers()
 	if err := r.finalizers.Register("util.lanford.io/delete-image", finalizerFunc(func(ctx context.Context, obj client.Object) (finalizer.Result, error) {
 		l := logr.FromContextOrDiscard(ctx)
@@ -241,10 +249,6 @@ func (r *ImageReconciler) SetupWithManager(mgr ctrl.Manager, CacheDir string, Ex
 		}
 		return finalizer.Result{}, nil
 	})); err != nil {
-		return err
-	}
-
-	if err := mgr.Add(r.imageService); err != nil {
 		return err
 	}
 

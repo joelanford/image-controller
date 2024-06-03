@@ -166,7 +166,7 @@ func main() {
 		Scheme:          mgr.GetScheme(),
 		CacheDir:        cacheDir,
 		ExternalURLBase: *externalURLBase,
-	}).SetupWithManager(mgr, cacheDir, *externalURLBase); err != nil {
+	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Image")
 		os.Exit(1)
 	}
